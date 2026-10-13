@@ -1,35 +1,17 @@
-"""Cloudflare tunnel management, worker-side.
-
-Two supported modes (selected via ``TUNNEL_MODE`` env on the worker):
-
-  * ``quick``   (default) - ``cloudflared tunnel --url http://127.0.0.1:<port>``
-    launches a random ``*.trycloudflare.com`` public URL. The URLs are
-    discovered by parsing the cloudflared log (rapid timer, no token needed).
-    This is the zero-config mode used by the reference notebook.
-
-  * ``named``   — requires CLOUDFLARE_TOKEN + TUNNEL_DOMAIN. The worker runs a
-    *named* tunnel and (re)connects it; the public URL is deterministic
-    (``https://<worker-id>.<domain>``) so the controller can compute it without
-    reading logs. Best for production: stable URLs survive restarts.
-
-Whichever mode, the tunnel fronts ONLY the worker agent (never ComfyUI directly).
-The agent's /health + /status mirror the public URL so the controller can verify
-the mapping it expects, and auto-re-establish a dead tunnel.
-"""
+"""Cloudflare tunnel management, worker-side."""
 from __future__ import annotations
 
 import logging
 import os
 import re
-import shutil
 import subprocess
-import threading
 import time
 from typing import Optional
 
 log = logging.getLogger("worker.cloudflare")
 
 _QUICK_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+_RATE_LIMIT_RE = re.compile(r"(429|1015|rate.?limit)", re.IGNORECASE)
 
 
 def ensure_cloudflared(bin_path: str = "/tmp/cloudflared") -> str:
@@ -40,8 +22,7 @@ def ensure_cloudflared(bin_path: str = "/tmp/cloudflared") -> str:
     subprocess.run(
         ["wget", "-q",
          "https://github.com/cloudflare/cloudflared/releases/latest/download/"
-         "cloudflared-linux-amd64", "-O", bin_path],
-        check=True)
+         "cloudflared-linux-amd64", "-O", bin_path], check=True)
     os.chmod(bin_path, 0o755)
     return bin_path
 
@@ -57,6 +38,16 @@ def parse_quick_url(log_path: str) -> Optional[str]:
     return urls[-1] if urls else None
 
 
+def _log_has_rate_limit(log_path: str) -> bool:
+    """Detect a Cloudflare rate-limit response in the tunnel log."""
+    try:
+        with open(log_path, "r", errors="ignore") as f:
+            tail = f.read()[-2000:]
+    except FileNotFoundError:
+        return False
+    return bool(_RATE_LIMIT_RE.search(tail))
+
+
 class QuickTunnel:
     """Run/restart a cloudflared quick tunnel and track its public URL."""
 
@@ -67,24 +58,25 @@ class QuickTunnel:
         self.bin = ensure_cloudflared(bin_path)
         self.proc: Optional[subprocess.Popen] = None
         self.public_url: Optional[str] = None
+        self._log_fd = None
 
     def start(self) -> None:
         self.stop()
         os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
-        # Truncate ('w') so parse_quick_url only ever sees URLs from THIS tunnel
-        # instance. With append ('a') a prior run's URL lingers in the log and a
-        # restart would wrongly report the old (possibly dead) tunnel URL.
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            self.proc = subprocess.Popen(
-                [self.bin, "tunnel", "--url", f"http://127.0.0.1:{self.local_port}",
-                 "--no-autoupdate"],
-                stdout=f, stderr=subprocess.STDOUT,
-            )
+        self._log_fd = open(self.log_path, "w", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            [self.bin, "tunnel",
+             "--url", f"http://127.0.0.1:{self.local_port}",
+             "--no-autoupdate",
+             "--protocol", "http2",
+             "--edge-ip-version", "auto"],
+            stdout=self._log_fd,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
 
     def is_alive(self) -> bool:
-        """True while the cloudflared process is running and has a URL."""
         if self.proc is None:
-            # We may not have started yet; treat as alive once URL known.
             return bool(self.public_url)
         if self.proc.poll() is not None:
             return False
@@ -94,32 +86,52 @@ class QuickTunnel:
 
     def stop(self) -> None:
         if self.proc:
-            self.proc.terminate()
             try:
-                self.proc.wait(timeout=10)
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
             except Exception:
-                self.proc.kill()
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
             self.proc = None
+        if self._log_fd is not None:
+            try:
+                self._log_fd.close()
+            except Exception:
+                pass
+            self._log_fd = None
 
     def wait_for_url(self, timeout_s: int = 60) -> Optional[str]:
-        """Poll the log until a URL appears. Re-start once if it stalls."""
         deadline = time.time() + timeout_s
+        consecutive_deaths = 0
         while time.time() < deadline:
             url = parse_quick_url(self.log_path)
             if url:
                 self.public_url = url
                 return url
+
             if self.proc and self.proc.poll() is not None:
-                log.warning("cloudflared died; restarting")
+                consecutive_deaths += 1
+                if _log_has_rate_limit(self.log_path):
+                    log.error("Cloudflare rate limit (429/1015) - attente 120s")
+                    time.sleep(120)
+                    self.start()
+                    continue
+                if consecutive_deaths >= 3:
+                    log.error("cloudflared est mort 3 fois - arret definitif")
+                    return None
+                backoff = min(5 * (2 ** (consecutive_deaths - 1)), 30)
+                log.warning("cloudflared died (%d/3) - attente %ds",
+                            consecutive_deaths, backoff)
+                time.sleep(backoff)
                 self.start()
-            time.sleep(2)
-        urls = parse_quick_url(self.log_path)
-        if urls:
-            self.public_url = urls
-            return urls
+            else:
+                time.sleep(1)
+
         return None
 
 
 def named_tunnel_url(sub_id: str, domain: str) -> str:
-    """Deterministic public URL for a named tunnel  with one known hostname."""
+    """Deterministic public URL for a named tunnel with one known hostname."""
     return f"https://{sub_id}.{domain}"
